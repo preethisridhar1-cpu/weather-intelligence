@@ -1,0 +1,6 @@
+{
+  "name": "AeroSight",
+  "description": "AI Weather Intelligence Engine synthesizing weather metrics into actionable activity, outfit, and safety advisories.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
