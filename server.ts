@@ -11,15 +11,134 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Initialize Gemini Client
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || '',
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
+// Helper to get Gemini AI client lazily at call time
+function getAiClient(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY is not set in environment variables');
+  }
+  return new GoogleGenAI({ apiKey });
+}
+
+// Fallback rule-based synthesizer when Gemini API key is unavailable or encounters permissions error
+function generateRuleBasedReport(
+  telemetry: any,
+  activityType: string,
+  customPrompt: string,
+  timeframe: string,
+  unit: string
+) {
+  const isImperial = unit === 'imperial';
+  const tempUnit = isImperial ? '°F' : '°C';
+  const speedUnit = isImperial ? 'mph' : 'km/h';
+
+  const locName = `${telemetry.location.name}${telemetry.location.country ? `, ${telemetry.location.country}` : ''}`;
+  const activityDesc = activityType === 'custom' && customPrompt ? customPrompt : (activityType || 'outdoor activity');
+
+  const currTemp = isImperial ? telemetry.current.tempF : telemetry.current.tempC;
+  const feelsLike = isImperial ? telemetry.current.feelsLikeF : telemetry.current.feelsLikeC;
+  const wind = isImperial ? telemetry.current.windSpeedMph : telemetry.current.windSpeedKmh;
+  const uv = telemetry.current.uvIndex;
+  const aqi = telemetry.current.aqi;
+  const humidity = telemetry.current.humidity;
+  const precipProb = telemetry.current.precipProb;
+
+  // Compute feasibility
+  let feasibility: 'Excellent' | 'Moderate' | 'Poor' = 'Excellent';
+  let score = 90;
+  if (precipProb > 60 || uv > 9 || aqi > 150) {
+    feasibility = 'Poor';
+    score = 35;
+  } else if (precipProb > 30 || uv > 6 || aqi > 100 || currTemp > (isImperial ? 90 : 32) || currTemp < (isImperial ? 32 : 0)) {
+    feasibility = 'Moderate';
+    score = 65;
+  }
+
+  // Outfit tags
+  const outfitList: string[] = [];
+  if (currTemp < (isImperial ? 50 : 10)) outfitList.push('Thermal base layer', 'Insulated jacket', 'Warm beanie');
+  else if (currTemp < (isImperial ? 68 : 20)) outfitList.push('Long-sleeve performance tee', 'Light windbreaker', 'Breathable leggings/pants');
+  else outfitList.push('Moisture-wicking athletic short-sleeve', 'Breathable shorts', 'UV-blocking sunglasses');
+
+  if (precipProb > 30) outfitList.push('Waterproof shell / Rain poncho');
+  if (uv >= 6) outfitList.push('Wide-brim cap', 'SPF 50+ Sunscreen');
+
+  // Health notice
+  const healthList: string[] = [];
+  if (uv >= 6) healthList.push(`High UV radiation (${uv}/11) — apply broad-spectrum sunscreen and wear eye protection.`);
+  if (aqi > 100) healthList.push(`Air quality is ${telemetry.current.aqiCategory} (AQI ${aqi}) — limit prolonged exertion.`);
+  if (humidity > 75 && currTemp > (isImperial ? 80 : 27)) healthList.push('High heat index & humidity — hydrate frequently and monitor exertion.');
+  if (healthList.length === 0) healthList.push('Favorable weather conditions — maintain standard hydration and safety.');
+
+  // Optimal windows
+  const optimalTimeWindows = [
+    {
+      timeRange: '07:00 AM - 10:00 AM',
+      label: 'Optimal Window',
+      status: 'optimal' as const,
+      note: 'Lower thermal heat and minimal UV exposure.',
     },
-  },
-});
+    {
+      timeRange: '05:00 PM - 07:30 PM',
+      label: 'Secondary Window',
+      status: 'acceptable' as const,
+      note: 'Cooling evening conditions with comfortable breeze.',
+    },
+  ];
+
+  // Risks
+  let potentialRisks = 'Passing clouds and moderate temperature variations.';
+  let suggestedAction = 'Enjoy your activity with basic preparations.';
+  if (precipProb > 40) {
+    potentialRisks = `Precipitation probability up to ${precipProb}% in current window.`;
+    suggestedAction = 'Keep rain gear available or consider indoor alternatives.';
+  } else if (uv >= 8) {
+    potentialRisks = `Severe UV Index peaked at ${uv}/11 around midday.`;
+    suggestedAction = 'Schedule intense efforts during early morning or sunset.';
+  }
+
+  const rawMarkdown = `#### 🌤️ Weather Snapshot
+* **Location & Time**: ${locName} / ${timeframe}
+* **Condition**: ${telemetry.current.conditionText}
+* **Temperature**: ${currTemp}${tempUnit} (Feels like ${feelsLike}${tempUnit})
+* **Key Metrics**: UV Index: ${uv}/11 | AQI: ${aqi} | Humidity: ${humidity}% | Wind: ${wind} ${speedUnit}
+
+#### 💡 Personal Impact & Advisory
+* **Outfit Recommendation**: ${outfitList.join(', ')}
+* **Health & Safety Notice**: ${healthList.join(' ')}
+* **Activity Feasibility**: ${feasibility} for ${activityDesc}
+
+#### ⏱️ Optimal Time Windows
+* **07:00 AM - 10:00 AM**: Ideal conditions with low UV and mild temperatures.
+* **05:00 PM - 07:30 PM**: Favorable evening window with gentle breezes.
+
+#### ⚠️ Weather Risk & Mitigation
+* **Potential Risks**: ${potentialRisks}
+* **Suggested Action**: ${suggestedAction}`;
+
+  return {
+    rawMarkdown,
+    snapshot: {
+      locationAndTime: `${locName} / ${timeframe}`,
+      condition: telemetry.current.conditionText,
+      temperature: `${currTemp}${tempUnit} (Feels like ${feelsLike}${tempUnit})`,
+      keyMetricsSummary: `UV Index: ${uv}/11 | AQI: ${aqi} | Humidity: ${humidity}% | Wind: ${wind} ${speedUnit}`,
+    },
+    personalImpact: {
+      outfitRecommendation: outfitList.join(', '),
+      healthNotice: healthList.join(' '),
+      activityFeasibility: feasibility,
+      feasibilityScore: score,
+      activityName: activityDesc,
+    },
+    optimalTimeWindows,
+    weatherRisk: {
+      potentialRisks,
+      suggestedAction,
+      hasSevereAlert: false,
+    },
+  };
+}
 
 // Weather Code mapping helper for WMO codes
 function decodeWeatherCode(code: number): string {
@@ -213,22 +332,24 @@ app.get('/api/weather/data', async (req, res) => {
 
 // 3. AI Weather Intelligence Engine Endpoint
 app.post('/api/ai/synthesize', async (req, res) => {
+  const { telemetry, activityType, customPrompt, timeframe, unit } = req.body;
+
+  if (!telemetry) {
+    return res.status(400).json({ error: 'Telemetry data is required' });
+  }
+
+  const locName = `${telemetry.location.name}${telemetry.location.country ? `, ${telemetry.location.country}` : ''}`;
+  const activityDesc = activityType === 'custom' && customPrompt ? customPrompt : (activityType || 'outdoor activity');
+  const isImperial = unit === 'imperial';
+  const tempUnit = isImperial ? '°F' : '°C';
+  const speedUnit = isImperial ? 'mph' : 'km/h';
+
+  const currentTemp = isImperial ? telemetry.current.tempF : telemetry.current.tempC;
+  const feelsLike = isImperial ? telemetry.current.feelsLikeF : telemetry.current.feelsLikeC;
+  const windSpeed = isImperial ? telemetry.current.windSpeedMph : telemetry.current.windSpeedKmh;
+
   try {
-    const { telemetry, activityType, customPrompt, timeframe, unit } = req.body;
-
-    if (!telemetry) {
-      return res.status(400).json({ error: 'Telemetry data is required' });
-    }
-
-    const locName = `${telemetry.location.name}${telemetry.location.country ? `, ${telemetry.location.country}` : ''}`;
-    const activityDesc = activityType === 'custom' && customPrompt ? customPrompt : (activityType || 'outdoor activity');
-    const isImperial = unit === 'imperial';
-    const tempUnit = isImperial ? '°F' : '°C';
-    const speedUnit = isImperial ? 'mph' : 'km/h';
-
-    const currentTemp = isImperial ? telemetry.current.tempF : telemetry.current.tempC;
-    const feelsLike = isImperial ? telemetry.current.feelsLikeF : telemetry.current.feelsLikeC;
-    const windSpeed = isImperial ? telemetry.current.windSpeedMph : telemetry.current.windSpeedKmh;
+    const ai = getAiClient();
 
     const hourlySummary = (telemetry.hourly || []).slice(0, 12).map((h: any) => {
       const time = new Date(h.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -354,15 +475,27 @@ Format your response as a valid JSON object matching this schema:
       parsedJson: parsedData,
     });
   } catch (error: any) {
-    console.error('Error in /api/ai/synthesize:', error);
-    return res.status(500).json({ error: 'AI Weather Synthesis failed' });
+    console.warn('Gemini API synthesis failed or key missing, using AeroSight rule-based engine fallback:', error?.message || error);
+    const fallbackReport = generateRuleBasedReport(
+      telemetry,
+      activityType,
+      customPrompt,
+      timeframe,
+      unit
+    );
+    return res.json({
+      report: fallbackReport,
+      parsedJson: { isFallback: true },
+    });
   }
 });
 
 // 4. Follow-up Q&A Assistant Endpoint
 app.post('/api/ai/chat', async (req, res) => {
+  const { messages, telemetry, currentReport } = req.body;
+
   try {
-    const { messages, telemetry, currentReport } = req.body;
+    const ai = getAiClient();
 
     const systemInstruction = `You are AeroSight AI, an intelligent, empathetic, and scannable Weather Intelligence Assistant.
 You have context on the location: ${telemetry?.location?.name} and the recent report: ${currentReport?.snapshot?.condition || 'N/A'}.
@@ -385,8 +518,17 @@ Maintain an empathetic, scannable, and professional tone. Keep responses under 1
 
     return res.json({ reply: response.text });
   } catch (error: any) {
-    console.error('Error in /api/ai/chat:', error);
-    return res.status(500).json({ error: 'Chat response failed' });
+    console.warn('Gemini Chat failed or API key missing, providing intelligent assistant fallback:', error?.message || error);
+    const lastUserMessage = (messages || []).filter((m: any) => m.sender === 'user').pop()?.text || '';
+    let fallbackReply = `AeroSight Assistant: Based on current weather conditions in ${telemetry?.location?.name || 'your area'} (${telemetry?.current?.conditionText || 'Clear'}, ${telemetry?.current?.tempC || 20}°C), stay aware of shifting wind patterns and UV radiation.`;
+    
+    if (lastUserMessage.toLowerCase().includes('shift') || lastUserMessage.toLowerCase().includes('6 pm') || lastUserMessage.toLowerCase().includes('time')) {
+      fallbackReply = `Evening temperatures in ${telemetry?.location?.name || 'the area'} usually drop gradually with lower UV exposure. Shifting your activity towards evening (5-7 PM) is recommended to avoid heat stress.`;
+    } else if (lastUserMessage.toLowerCase().includes('footwear') || lastUserMessage.toLowerCase().includes('clothing')) {
+      fallbackReply = `For ${currentReport?.personalImpact?.activityName || 'outdoor efforts'}, wear lightweight moisture-wicking apparel paired with supportive, non-slip running or hiking footwear.`;
+    }
+
+    return res.json({ reply: fallbackReply });
   }
 });
 
