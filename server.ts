@@ -214,6 +214,36 @@ app.get('/api/weather/search', async (req, res) => {
   }
 });
 
+// Helper for resilient fetch with exponential backoff retries for third-party weather APIs
+async function fetchWithRetry(url: string, maxRetries = 2, delayMs = 300): Promise<Response> {
+  let lastError: any = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 6000);
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      if (res.ok) {
+        return res;
+      }
+      if (res.status === 503 || res.status === 429) {
+        lastError = new Error(`Open-Meteo responded with status ${res.status}`);
+        if (attempt < maxRetries) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
+          continue;
+        }
+      }
+      return res;
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError || new Error(`Failed to fetch ${url}`);
+}
+
 // 2. Weather Data Telemetry Fetcher
 app.get('/api/weather/data', async (req, res) => {
   const lat = parseFloat(req.query.lat as string) || 37.7749; // default San Francisco
@@ -223,13 +253,8 @@ app.get('/api/weather/data', async (req, res) => {
   const timeframe = (req.query.timeframe as string) || 'today';
 
   try {
-    // Fetch Weather Forecast with 5s AbortController timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-
     const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,rain,showers,snowfall,weather_code,surface_pressure,wind_speed_10m,wind_direction_10m,uv_index&hourly=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation_probability,weather_code,surface_pressure,visibility,wind_speed_10m,uv_index&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max&timezone=auto`;
-    const weatherRes = await fetch(weatherUrl, { signal: controller.signal });
-    clearTimeout(timeoutId);
+    const weatherRes = await fetchWithRetry(weatherUrl);
 
     if (!weatherRes.ok) {
       throw new Error(`Open-Meteo responded with status ${weatherRes.status}`);
@@ -241,11 +266,8 @@ app.get('/api/weather/data', async (req, res) => {
     let aqi = 32;
     let aqiCategory = 'Good';
     try {
-      const aqiController = new AbortController();
-      const aqiTimeout = setTimeout(() => aqiController.abort(), 3000);
       const aqiUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lng}&current=us_aqi&timezone=auto`;
-      const aqiRes = await fetch(aqiUrl, { signal: aqiController.signal });
-      clearTimeout(aqiTimeout);
+      const aqiRes = await fetchWithRetry(aqiUrl, 1, 200);
       const aqiData = await aqiRes.json();
       if (aqiData.current?.us_aqi !== undefined) {
         aqi = Math.round(aqiData.current.us_aqi);
